@@ -1,4 +1,4 @@
-name: build-binaries
+name: test-build-binaries
 
 on:
   push:
