@@ -1105,6 +1105,82 @@ fn prefixed_model_id(provider_name: &str, model_id: &str) -> String {
     format!("{provider_name}/{model_id}")
 }
 
+fn parse_custom_model_created_at(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(number) => number.as_u64(),
+        serde_json::Value::String(raw) => {
+            time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+                .ok()
+                .and_then(|dt| dt.unix_timestamp().try_into().ok())
+        }
+        _ => None,
+    }
+}
+
+/// Bounded compatibility for custom OpenAI-like `/v1/models` responses.
+///
+/// The final parse target stays strict `OpenAiModelList`; this helper only
+/// fills missing canonical fields for custom-channel bodies that already have
+/// usable `data[*].id` values.
+fn normalize_custom_openai_model_list_body(provider_name: &str, body: &[u8]) -> Option<Vec<u8>> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return None;
+    };
+    let Some(root) = value.as_object_mut() else {
+        return None;
+    };
+    if root.contains_key("error") {
+        return None;
+    }
+    let Some(items) = root
+        .get_mut("data")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return None;
+    };
+
+    let original_items = std::mem::take(items);
+    let mut normalized_items = Vec::with_capacity(original_items.len());
+    for mut item in original_items {
+        let Some(model) = item.as_object_mut() else {
+            continue;
+        };
+        let has_usable_id = model
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| !id.trim().is_empty());
+        if !has_usable_id {
+            continue;
+        }
+        model
+            .entry("object".to_string())
+            .or_insert_with(|| serde_json::Value::from("model"));
+        if !model.contains_key("created") {
+            let created = model
+                .get("created_at")
+                .and_then(parse_custom_model_created_at)
+                .unwrap_or(0);
+            model.insert("created".to_string(), serde_json::Value::from(created));
+        }
+        model
+            .entry("owned_by".to_string())
+            .or_insert_with(|| serde_json::Value::from(provider_name.to_string()));
+        normalized_items.push(item);
+    }
+
+    if normalized_items.is_empty() {
+        return None;
+    }
+
+    root.entry("object".to_string())
+        .or_insert_with(|| serde_json::Value::from("list"));
+    root.insert(
+        "data".to_string(),
+        serde_json::Value::Array(normalized_items),
+    );
+    serde_json::to_vec(&value).ok()
+}
+
 async fn collect_unscoped_authorized_models(
     state: &AppState,
     user_id: i64,
@@ -1232,9 +1308,25 @@ async fn build_openai_unscoped_model_list_body(
                 let ExecuteBody::Full(body) = result.body else {
                     continue;
                 };
-                let Ok(response) = serde_json::from_slice::<
+                let provider_channel = state.provider_channel_for_name(&provider.provider_name);
+                let parsed = serde_json::from_slice::<
                     gproxy_sdk::protocol::openai::types::OpenAiModelList,
-                >(&body) else {
+                >(&body)
+                .ok()
+                .or_else(|| {
+                    (provider_channel.as_deref() == Some("custom"))
+                        .then(|| {
+                            normalize_custom_openai_model_list_body(&provider.provider_name, &body)
+                        })
+                        .flatten()
+                        .and_then(|normalized| {
+                            serde_json::from_slice::<
+                                gproxy_sdk::protocol::openai::types::OpenAiModelList,
+                            >(&normalized)
+                            .ok()
+                        })
+                });
+                let Some(response) = parsed else {
                     last_error = Some(HttpError::internal(format!(
                         "provider '{}' returned invalid OpenAI model list body",
                         provider.provider_name
@@ -3223,10 +3315,13 @@ mod tests {
         HeaderMap, HeaderValue, StatusCode,
         header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING},
     };
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use axum::{Json, Router};
     use bytes::Bytes;
     use gproxy_sdk::engine::engine::{GproxyEngine, ProviderConfig, Usage};
+    use gproxy_sdk::protocol::openai::types::{
+        OpenAiListObject, OpenAiModelList, OpenAiModelObject,
+    };
     use gproxy_server::middleware::classify::{BufferedBodyBytes, Classification};
     use gproxy_server::middleware::model_alias::ResolvedAlias;
     use gproxy_server::middleware::request_model::ExtractedModel;
@@ -3242,7 +3337,8 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        UsageRecordContext, normalize_response_headers, proxy, proxy_unscoped, record_usage,
+        UsageRecordContext, normalize_custom_openai_model_list_body, normalize_response_headers,
+        proxy, proxy_unscoped, record_usage,
     };
     use crate::auth::AuthenticatedUser;
 
@@ -3313,6 +3409,32 @@ mod tests {
             axum::serve(listener, app)
                 .await
                 .expect("named mock upstream should serve");
+        });
+
+        (format!("http://{addr}"), handle)
+    }
+
+    async fn spawn_custom_model_list_server(
+        response: serde_json::Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind custom model list upstream");
+        let addr = listener
+            .local_addr()
+            .expect("custom model list upstream addr");
+        let app = Router::new().route(
+            "/v1/models",
+            get(move || {
+                let response = response.clone();
+                async move { Json(response) }
+            }),
+        );
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("custom model list upstream should serve");
         });
 
         (format!("http://{addr}"), handle)
@@ -3766,6 +3888,161 @@ mod tests {
                 .as_deref()
                 .is_some_and(|url| url.starts_with(&alpha_base_url)),
             "explicit provider prefix should keep the request on alpha"
+        );
+    }
+
+    #[test]
+    fn normalize_custom_openai_model_list_body_requires_usable_ids() {
+        let body = serde_json::to_vec(&json!({
+            "data": [
+                {
+                    "type": "model",
+                    "created_at": "2024-01-01T00:00:00Z"
+                },
+                {
+                    "id": "   ",
+                    "type": "model"
+                }
+            ]
+        }))
+        .expect("body should serialize");
+
+        assert!(
+            normalize_custom_openai_model_list_body("apiport", &body).is_none(),
+            "compatibility path must reject bodies without usable string ids"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_unscoped_model_list_normalizes_custom_openai_like_body() {
+        let (base_url, server_handle) = spawn_custom_model_list_server(json!({
+            "data": [
+                {
+                    "id": "gpt-5.4",
+                    "type": "model",
+                    "display_name": "gpt-5.4",
+                    "created_at": "2024-01-01T00:00:00Z"
+                },
+                {
+                    "id": "strict-model",
+                    "object": "model",
+                    "created": 7,
+                    "owned_by": "upstream-owner"
+                },
+                {
+                    "type": "model",
+                    "created_at": "2024-01-01T00:00:00Z"
+                }
+            ],
+            "object": "list"
+        }))
+        .await;
+        let state = build_unscoped_proxy_state(base_url).await;
+
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .expect("request should build");
+        request.extensions_mut().insert(Classification::new(
+            gproxy_server::OperationFamily::ModelList,
+            gproxy_server::ProtocolKind::OpenAi,
+        ));
+
+        let response = proxy_unscoped(
+            State(state),
+            Extension(AuthenticatedUser(MemoryUserKey {
+                id: 10,
+                user_id: 1,
+                api_key: "sk-test".to_string(),
+                label: Some("default".to_string()),
+                enabled: true,
+            })),
+            request,
+        )
+        .await
+        .expect("unscoped model list should succeed");
+
+        server_handle.abort();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("response body should read");
+        let parsed: OpenAiModelList =
+            serde_json::from_slice(&body).expect("response should be canonical OpenAI model list");
+
+        assert_eq!(parsed.object, OpenAiListObject::List);
+        assert_eq!(
+            parsed.data.len(),
+            2,
+            "items without usable ids must be dropped"
+        );
+
+        let apiport = parsed
+            .data
+            .iter()
+            .find(|model| model.id == "test/gpt-5.4")
+            .expect("normalized apiport-style model should be present");
+        assert_eq!(apiport.object, OpenAiModelObject::Model);
+        assert_eq!(apiport.created, 1_704_067_200);
+        assert_eq!(apiport.owned_by, "test");
+
+        let strict = parsed
+            .data
+            .iter()
+            .find(|model| model.id == "test/strict-model")
+            .expect("strict model should be present");
+        assert_eq!(strict.object, OpenAiModelObject::Model);
+        assert_eq!(strict.created, 7);
+        assert_eq!(strict.owned_by, "test");
+    }
+
+    #[tokio::test]
+    async fn proxy_unscoped_model_list_rejects_custom_body_without_usable_ids() {
+        let (base_url, server_handle) = spawn_custom_model_list_server(json!({
+            "data": [
+                {
+                    "type": "model",
+                    "created_at": "2024-01-01T00:00:00Z"
+                }
+            ],
+            "object": "list"
+        }))
+        .await;
+        let state = build_unscoped_proxy_state(base_url).await;
+
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .expect("request should build");
+        request.extensions_mut().insert(Classification::new(
+            gproxy_server::OperationFamily::ModelList,
+            gproxy_server::ProtocolKind::OpenAi,
+        ));
+
+        let error = proxy_unscoped(
+            State(state),
+            Extension(AuthenticatedUser(MemoryUserKey {
+                id: 10,
+                user_id: 1,
+                api_key: "sk-test".to_string(),
+                label: Some("default".to_string()),
+                enabled: true,
+            })),
+            request,
+        )
+        .await
+        .expect_err("invalid custom model list should still be rejected");
+
+        server_handle.abort();
+
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            error.message.contains("invalid OpenAI model list body"),
+            "unexpected error: {}",
+            error.message
         );
     }
 
